@@ -6,18 +6,57 @@ import time
 from pprint import pprint
 
 import googleapiclient.discovery
+import googleapiclient.errors
 import google.auth
 
 credentials, project = google.auth.default()
 service = googleapiclient.discovery.build('compute', 'v1', credentials=credentials)
 
-#
-# Stub code - just lists all instances
-#
-def list_instances(compute, project, zone):
-    result = compute.instances().list(project=project, zone=zone).execute()
-    return result['items'] if 'items' in result else None
+ZONE = "us-west1-b"
+SOURCE_INSTANCE = "lab5-part1-vm"
+SNAPSHOT_NAME = f"base-snapshot-{SOURCE_INSTANCE}"
 
-print("Your running instances are:")
-for instance in list_instances(service, project, 'us-west1-b'):
-    print(instance['name'])
+def wait_for_zone_op(compute, project, zone, op_name):
+    while True:
+        op = compute.zoneOperations().get(project=project, zone=zone, operation=op_name).execute()
+        if op.get("status") == "DONE":
+            if "error" in op:
+                raise RuntimeError(op["error"])
+            return
+        time.sleep(2)
+
+def snapshot_exists(compute, project, snapshot_name):
+    try:
+        compute.snapshots().get(project=project, snapshot=snapshot_name).execute()
+        return True
+    except googleapiclient.errors.HttpError as e:
+        if e.resp.status == 404:
+            return False
+        raise
+
+def get_boot_disk_name(compute, project, zone, instance_name):
+    inst = compute.instances().get(project=project, zone=zone, instance=instance_name).execute()
+    for d in inst.get("disks", []):
+        if d.get("boot"):
+            # d["source"] is a URL ending in /disks/<diskname>
+            return d["source"].split("/")[-1]
+    raise RuntimeError("Could not find boot disk on instance")
+
+def create_snapshot_from_disk(compute, project, zone, disk_name, snapshot_name):
+    body = {"name": snapshot_name}
+    op = compute.disks().createSnapshot(project=project, zone=zone, disk=disk_name, body=body).execute()
+    wait_for_zone_op(compute, project, zone, op["name"])
+
+def main():
+    if snapshot_exists(service, project, SNAPSHOT_NAME):
+        print(f"Snapshot already exists: {SNAPSHOT_NAME}")
+        return
+
+    boot_disk = get_boot_disk_name(service, project, ZONE, SOURCE_INSTANCE)
+    print(f"Boot disk for {SOURCE_INSTANCE}: {boot_disk}")
+    print(f"Creating snapshot: {SNAPSHOT_NAME} ...")
+    create_snapshot_from_disk(service, project, ZONE, boot_disk, SNAPSHOT_NAME)
+    print("Snapshot created.")
+
+if __name__ == "__main__":
+    main()
