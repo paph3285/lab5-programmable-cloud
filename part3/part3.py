@@ -6,15 +6,24 @@ import time
 
 import googleapiclient.discovery
 import google.oauth2.service_account as service_account
+from googleapiclient.errors import HttpError
 
 
+# Build Compute Engine API client using a service account key
 def build_compute_service(creds_path: str):
     creds = service_account.Credentials.from_service_account_file(creds_path)
     return googleapiclient.discovery.build("compute", "v1", credentials=creds)
 
 
-def wait_for_zone_operation(compute, project: str, zone: str, operation_name: str, poll_seconds: int = 2):
-    """Poll a zonal operation until it finishes."""
+#  Operation helper: wait for zonal operations to finish
+def wait_for_zone_operation(
+    compute,
+    project: str,
+    zone: str,
+    operation_name: str,
+    poll_seconds: int = 2,
+):
+    """Poll a zonal operation until it finishes (DONE)."""
     while True:
         op = compute.zoneOperations().get(
             project=project, zone=zone, operation=operation_name
@@ -28,26 +37,50 @@ def wait_for_zone_operation(compute, project: str, zone: str, operation_name: st
         time.sleep(poll_seconds)
 
 
+# Instance helpers: list/get/exists
 def list_instances(compute, project: str, zone: str):
-    """Return a list of instance resource dicts."""
+    """Return a list of instance resource dicts (possibly empty)."""
     resp = compute.instances().list(project=project, zone=zone).execute()
     return resp.get("items", [])
 
 
 def get_instance(compute, project: str, zone: str, name: str):
+    """Fetch one instance resource dict."""
     return compute.instances().get(project=project, zone=zone, instance=name).execute()
 
 
+def instance_exists(compute, project: str, zone: str, name: str) -> bool:
+    """
+    Return True if instance exists, False if 404.
+    IMPORTANT: only 404 means "missing"; other errors should raise.
+    """
+    try:
+        compute.instances().get(project=project, zone=zone, instance=name).execute()
+        return True
+    except HttpError as e:
+        if getattr(e, "resp", None) is not None and e.resp.status == 404:
+            return False
+        raise
+
+
+def get_instance_tags(compute, project: str, zone: str, name: str) -> list[str]:
+    """Return tag list for an instance (possibly empty)."""
+    inst = get_instance(compute, project, zone, name)
+    return inst.get("tags", {}).get("items", [])
+
+
+# Base instance config extraction
 def get_base_instance_config(compute, project: str, zone: str, base_instance: str):
     """
-    Extract minimal info from a base instance to make clones:
-    - machine type
-    - network/subnetwork
-    - boot disk source image (fallback to Debian 12 if unavailable)
+    Extract minimal config from the base instance to create clones:
+      - machineType
+      - network + subnetwork
+      - boot disk sourceImage (fallback to Debian 12 if missing)
     """
     inst = get_instance(compute, project, zone, base_instance)
 
     machine_type = inst["machineType"]
+
     net = inst["networkInterfaces"][0]
     network = net.get("network")
     subnetwork = net.get("subnetwork")
@@ -58,26 +91,19 @@ def get_base_instance_config(compute, project: str, zone: str, base_instance: st
             boot_disk = d
             break
     if not boot_disk:
-        raise RuntimeError("Base instance has no boot disk?")
+        raise RuntimeError("Base instance has no boot disk (unexpected).")
 
     init_params = boot_disk.get("initializeParams", {})
     source_image = init_params.get("sourceImage")
 
-    # Fallback if sourceImage not present
+    # Fallback if sourceImage not present (some instances won’t have it on GET)
     if not source_image:
         source_image = "projects/debian-cloud/global/images/family/debian-12"
 
     return machine_type, network, subnetwork, source_image
 
 
-def instance_exists(compute, project: str, zone: str, name: str) -> bool:
-    try:
-        _ = get_instance(compute, project, zone, name)
-        return True
-    except Exception:
-        return False
-
-
+# Create instance (clone)
 def create_instance(
     compute,
     project: str,
@@ -91,13 +117,12 @@ def create_instance(
 ):
     """
     Create a VM instance.
-    Note: This creates a new boot disk from source_image (not a full disk clone/snapshot).
-    For this lab, that's usually acceptable unless your instructions explicitly require snapshots.
+    NOTE: This creates a NEW boot disk from source_image (not a snapshot clone).
+    For many labs, this is acceptable unless they explicitly require snapshots.
     """
     body = {
         "name": name,
         "machineType": machine_type,
-        "tags": {"items": tags} if tags else None,
         "disks": [
             {
                 "boot": True,
@@ -111,20 +136,22 @@ def create_instance(
             {
                 "network": network,
                 "subnetwork": subnetwork,
+                # This adds an external NAT IP (counts toward IN_USE_ADDRESSES quota)
                 "accessConfigs": [{"name": "External NAT", "type": "ONE_TO_ONE_NAT"}],
             }
         ],
     }
 
-    # remove None fields (Compute API can be picky)
-    if body["tags"] is None:
-        body.pop("tags", None)
+    # Only include tags if non-empty
+    if tags:
+        body["tags"] = {"items": tags}
 
     op = compute.instances().insert(project=project, zone=zone, body=body).execute()
     wait_for_zone_operation(compute, project, zone, op["name"])
     return op
 
 
+# CLI args
 def parse_args():
     p = argparse.ArgumentParser(
         description="Lab 5 Part 3: Use Python + Compute Engine API to manage instances."
@@ -144,6 +171,7 @@ def parse_args():
     return p.parse_args()
 
 
+# main
 def main():
     args = parse_args()
 
@@ -166,11 +194,13 @@ def main():
     machine_type, network, subnetwork, source_image = get_base_instance_config(
         compute, args.project, args.zone, args.base
     )
+    base_tags = get_instance_tags(compute, args.project, args.zone, args.base)
 
     print("\nBase config:")
-    print(f" - base:         {args.base}")
-    print(f" - machineType:  {machine_type}")
-    print(f" - sourceImage:  {source_image}")
+    print(f" - base:        {args.base}")
+    print(f" - machineType: {machine_type}")
+    print(f" - sourceImage: {source_image}")
+    print(f" - tags:        {base_tags}")
 
     for i in range(1, args.count + 1):
         name = f"{args.prefix}-{i}-{args.base}"
@@ -189,7 +219,7 @@ def main():
             network=network,
             subnetwork=subnetwork,
             source_image=source_image,
-            tags=["allow-ssh"],  # add tags if your lab requires them
+            tags=base_tags,
         )
         print(f"Created: {name}")
 
