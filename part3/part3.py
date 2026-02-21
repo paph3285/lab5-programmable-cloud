@@ -3,28 +3,31 @@
 import argparse
 import os
 import time
-from typing import List, Tuple, Optional
 
 import googleapiclient.discovery
 import google.oauth2.service_account as service_account
 from googleapiclient.errors import HttpError
 
 
-# ----------------------------
-# Build Compute Engine API client
-# ----------------------------
+# Build Compute Engine API client using a service account key
 def build_compute_service(creds_path: str):
     creds = service_account.Credentials.from_service_account_file(creds_path)
     return googleapiclient.discovery.build("compute", "v1", credentials=creds)
 
 
-# ----------------------------
-# Operation helper
-# ----------------------------
-def wait_for_zone_operation(compute, project: str, zone: str, operation_name: str, poll_seconds: int = 2):
+#  Operation helper: wait for zonal operations to finish
+def wait_for_zone_operation(
+    compute,
+    project: str,
+    zone: str,
+    operation_name: str,
+    poll_seconds: int = 2,
+):
     """Poll a zonal operation until it finishes (DONE)."""
     while True:
-        op = compute.zoneOperations().get(project=project, zone=zone, operation=operation_name).execute()
+        op = compute.zoneOperations().get(
+            project=project, zone=zone, operation=operation_name
+        ).execute()
 
         if op.get("status") == "DONE":
             if "error" in op:
@@ -34,9 +37,7 @@ def wait_for_zone_operation(compute, project: str, zone: str, operation_name: st
         time.sleep(poll_seconds)
 
 
-# ----------------------------
-# Instance helpers
-# ----------------------------
+# Instance helpers: list/get/exists
 def list_instances(compute, project: str, zone: str):
     """Return a list of instance resource dicts (possibly empty)."""
     resp = compute.instances().list(project=project, zone=zone).execute()
@@ -62,18 +63,14 @@ def instance_exists(compute, project: str, zone: str, name: str) -> bool:
         raise
 
 
-def get_instance_tags(compute, project: str, zone: str, name: str) -> List[str]:
+def get_instance_tags(compute, project: str, zone: str, name: str) -> list[str]:
     """Return tag list for an instance (possibly empty)."""
     inst = get_instance(compute, project, zone, name)
     return inst.get("tags", {}).get("items", [])
 
 
-# ----------------------------
-# Base instance config extraction 
-# ----------------------------
-def get_base_instance_config(
-    compute, project: str, zone: str, base_instance: str
-) -> Tuple[str, Optional[str], Optional[str], str]:
+# Base instance config extraction
+def get_base_instance_config(compute, project: str, zone: str, base_instance: str):
     """
     Extract minimal config from the base instance to create clones:
       - machineType
@@ -106,37 +103,23 @@ def get_base_instance_config(
     return machine_type, network, subnetwork, source_image
 
 
-# ----------------------------
-# Create instance 
-# ----------------------------
+# Create instance (clone)
 def create_instance(
     compute,
     project: str,
     zone: str,
     name: str,
     machine_type: str,
-    network: Optional[str],
-    subnetwork: Optional[str],
+    network: str,
+    subnetwork: str,
     source_image: str,
-    tags: List[str],
-    external_ip: bool,
+    tags: list[str],
 ):
     """
     Create a VM instance.
-
     NOTE: This creates a NEW boot disk from source_image (not a snapshot clone).
+    For many labs, this is acceptable unless they explicitly require snapshots.
     """
-    nic = {
-        "network": network,
-        "subnetwork": subnetwork,
-    }
-
-    # External IP toggle:
-    # - If external_ip=True, attach ONE_TO_ONE_NAT (consumes IN_USE_ADDRESSES quota)
-    # - If external_ip=False, don't attach accessConfigs (internal-only)
-    if external_ip:
-        nic["accessConfigs"] = [{"name": "External NAT", "type": "ONE_TO_ONE_NAT"}]
-
     body = {
         "name": name,
         "machineType": machine_type,
@@ -144,30 +127,31 @@ def create_instance(
             {
                 "boot": True,
                 "autoDelete": True,
-                "initializeParams": {"sourceImage": source_image},
+                "initializeParams": {
+                    "sourceImage": source_image,
+                },
             }
         ],
-        "networkInterfaces": [nic],
+        "networkInterfaces": [
+            {
+                "network": network,
+                "subnetwork": subnetwork,
+                # This adds an external NAT IP (counts toward IN_USE_ADDRESSES quota)
+                "accessConfigs": [{"name": "External NAT", "type": "ONE_TO_ONE_NAT"}],
+            }
+        ],
     }
 
+    # Only include tags if non-empty
     if tags:
         body["tags"] = {"items": tags}
 
-    try:
-        op = compute.instances().insert(project=project, zone=zone, body=body).execute()
-        wait_for_zone_operation(compute, project, zone, op["name"])
-        return True
-    except HttpError as e:
-        # If instance already exists, don't crash the whole run.
-        if getattr(e, "resp", None) is not None and e.resp.status == 409:
-            print(f"Already exists (409), skipping: {name}")
-            return False
-        raise
+    op = compute.instances().insert(project=project, zone=zone, body=body).execute()
+    wait_for_zone_operation(compute, project, zone, op["name"])
+    return op
 
 
-# ----------------------------
 # CLI args
-# ----------------------------
 def parse_args():
     p = argparse.ArgumentParser(
         description="Lab 5 Part 3: Use Python + Compute Engine API to manage instances."
@@ -184,27 +168,10 @@ def parse_args():
     p.add_argument("--create", action="store_true", help="Actually create instances")
     p.add_argument("--skip-existing", action="store_true", help="Skip clones that already exist")
 
-    # Quota-safe option
-    p.add_argument(
-        "--external-ip",
-        dest="external_ip",
-        action="store_true",
-        help="Attach an external IP to each clone (uses IN_USE_ADDRESSES quota).",
-    )
-    p.add_argument(
-        "--no-external-ip",
-        dest="external_ip",
-        action="store_false",
-        help="Do NOT attach external IPs to clones (internal-only).",
-    )
-    p.set_defaults(external_ip=True)
-
     return p.parse_args()
 
 
-# ----------------------------
 # main
-# ----------------------------
 def main():
     args = parse_args()
 
@@ -234,9 +201,6 @@ def main():
     print(f" - machineType: {machine_type}")
     print(f" - sourceImage: {source_image}")
     print(f" - tags:        {base_tags}")
-    print(f" - external_ip: {args.external_ip}")
-
-    created_any = False
 
     for i in range(1, args.count + 1):
         name = f"{args.prefix}-{i}-{args.base}"
@@ -246,7 +210,7 @@ def main():
             continue
 
         print(f"\nCreating: {name}")
-        did_create = create_instance(
+        create_instance(
             compute=compute,
             project=args.project,
             zone=args.zone,
@@ -256,18 +220,12 @@ def main():
             subnetwork=subnetwork,
             source_image=source_image,
             tags=base_tags,
-            external_ip=args.external_ip,
         )
-        if did_create:
-            print(f"Created: {name}")
-            created_any = True
+        print(f"Created: {name}")
 
     print("\nUpdated instances:")
     for inst in list_instances(compute, args.project, args.zone):
         print(f" - {inst['name']}")
-
-    if not created_any:
-        print("\n(No new instances were created.)")
 
 
 if __name__ == "__main__":
